@@ -1,13 +1,14 @@
 #include "wal.hpp"
 
+#include <catch2/catch_test_macros.hpp>
+
+#include <array>
 #include <cerrno>
-#include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <span>
 #include <stdexcept>
-#include <string>
 #include <string_view>
 #include <system_error>
 #include <unistd.h>
@@ -15,108 +16,298 @@
 
 namespace {
 
-struct Record {
-    std::uint64_t lsn;
-    std::string payload;
-
-    friend bool operator==(const Record&, const Record&) = default;
-};
-
 struct TempFile {
-    std::filesystem::path path;
+  std::filesystem::path path;
 
-    ~TempFile() {
-        std::error_code ignored;
-        std::filesystem::remove(path, ignored);
-    }
-};
-
-void check(bool condition, const char* message) {
-    if (!condition) {
-        throw std::runtime_error(message);
-    }
-}
-
-std::span<const std::byte> bytes(std::string_view text) {
-    return std::as_bytes(std::span<const char>{text.data(), text.size()});
-}
-
-void run() {
+  TempFile() {
     char pattern[] = "/tmp/wal-smoke-XXXXXX";
     const int fd = ::mkstemp(pattern);
     if (fd < 0) {
-        throw std::system_error(errno, std::generic_category(), "mkstemp");
+      throw std::system_error(errno, std::generic_category(), "mkstemp");
     }
-    TempFile file{pattern};
+    path = pattern;
     if (::close(fd) < 0) {
-        throw std::system_error(errno, std::generic_category(), "close temp file");
+      throw std::system_error(errno, std::generic_category(), "close temp file");
     }
+  }
 
-    {
-        wal::Wal log{file.path};
-        check(log.append(bytes("set alpha 1")) == 1, "first LSN must be 1");
-        check(log.append(bytes("set beta 2")) == 2, "second LSN must be 2");
-    }
+  ~TempFile() {
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+  }
+};
 
-    {
-        std::ofstream tail(file.path, std::ios::binary | std::ios::app);
-        check(tail.good(), "could not open WAL to simulate torn tail");
-        tail.write("\xa5\x5a", 2);
-        tail.close();
-        check(tail.good(), "could not write torn tail");
-    }
+std::span<const std::byte> bytes(std::string_view text) {
+  return std::as_bytes(std::span<const char>{text.data(), text.size()});
+}
 
-    {
-        wal::Wal log{file.path};
-        check(log.append(bytes("set gamma 3")) == 3, "recovery must preserve next LSN");
+std::vector<std::byte> byte_vector(std::string_view text) {
+  const auto data = bytes(text);
+  return {data.begin(), data.end()};
+}
 
-        std::vector<Record> actual;
-        log.replay([&](std::uint64_t lsn, std::span<const std::byte> payload) {
-            actual.push_back({
-                lsn,
-                std::string(reinterpret_cast<const char*>(payload.data()), payload.size()),
-            });
-        });
-        const std::vector<Record> expected{
-            {1, "set alpha 1"},
-            {2, "set beta 2"},
-            {3, "set gamma 3"},
-        };
-        check(actual == expected, "replay must return intact records in LSN order");
-    }
+wal::Record update(std::uint64_t txid, std::uint64_t page_id,
+                   std::uint64_t offset, std::string_view before,
+                   std::string_view after) {
+  wal::Record record{};
+  record.txid = txid;
+  record.recordType = wal::RecordType::Update;
+  record.pageID = page_id;
+  record.redoInformation.payload = byte_vector(after);
+  record.redoInformation.offset = offset;
+  record.undoInformation.offset = offset;
+  record.undoInformation.size = before.size();
+  record.beforeImage = byte_vector(before);
+  return record;
+}
 
-    {
-        std::fstream log(file.path, std::ios::binary | std::ios::in | std::ios::out);
-        check(log.good(), "could not open WAL to verify checksum");
-        log.seekg(24);
-        char byte{};
-        log.read(&byte, 1);
-        check(log.gcount() == 1, "could not read WAL payload for checksum test");
-        byte = static_cast<char>(byte ^ 1);
-        log.seekp(24);
-        log.write(&byte, 1);
-        log.flush();
-        check(log.good(), "could not corrupt WAL payload for checksum test");
-    }
+wal::Record commit(std::uint64_t txid) {
+  wal::Record record{};
+  record.txid = txid;
+  record.recordType = wal::RecordType::Commit;
+  return record;
+}
 
-    bool rejected_corruption = false;
-    try {
-        wal::Wal corrupted{file.path};
-    } catch (const std::runtime_error&) {
-        rejected_corruption = true;
-    }
-    check(rejected_corruption, "recovery must reject a checksum mismatch");
+wal::Record with_chain(wal::Record record, std::uint64_t lsn,
+                       std::uint64_t prev_lsn) {
+  record.lsn = lsn;
+  record.prevLsn = prev_lsn;
+  return record;
+}
+
+bool same_record(const wal::Record &left, const wal::Record &right) {
+  return left.lsn == right.lsn && left.txid == right.txid &&
+         left.prevLsn == right.prevLsn &&
+         left.recordType == right.recordType && left.pageID == right.pageID &&
+         left.redoInformation.payload == right.redoInformation.payload &&
+         left.redoInformation.offset == right.redoInformation.offset &&
+         left.undoInformation.offset == right.undoInformation.offset &&
+         left.undoInformation.size == right.undoInformation.size &&
+         left.beforeImage == right.beforeImage;
+}
+
+void append(wal::Wal &log, const wal::Record &record,
+            std::uint64_t expected_lsn) {
+  REQUIRE(log.append(record) == expected_lsn);
+}
+
+void expect_page(const wal::Page &page, std::string_view data,
+                 std::uint64_t lsn, std::uint64_t recovered_lsn) {
+  CHECK(page.data == byte_vector(data));
+  CHECK(page.lsn == lsn);
+  CHECK(page.recoveredLSN == recovered_lsn);
+}
+
+void append_recovery_history(wal::Wal &log) {
+  append(log, update(10, 1, 0, "00", "AA"), 1);
+  append(log, commit(10), 2);
+  append(log, update(20, 1, 0, "AA", "LL"), 3);
+  append(log, update(20, 1, 0, "LL", "MM"), 4);
+  append(log, update(30, 1, 0, "MM", "BB"), 5);
+  append(log, commit(30), 6);
+  append(log, update(40, 2, 2, "00", "XY"), 7);
+  append(log, commit(40), 8);
 }
 
 } // namespace
 
-int main() {
-    try {
-        run();
-        std::cout << "wal smoke: ok\n";
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "wal smoke: " << error.what() << '\n';
-        return 1;
-    }
+TEST_CASE("new WAL writes WAL1 file header") {
+  TempFile file;
+  {
+    wal::Wal log{file.path};
+  }
+
+  std::ifstream input(file.path, std::ios::binary);
+  std::array<char, 8> header{};
+  input.read(header.data(), static_cast<std::streamsize>(header.size()));
+  REQUIRE(input.gcount() == static_cast<std::streamsize>(header.size()));
+  CHECK((header == std::array<char, 8>{'W', 'A', 'L', '1', 0, 0, 0, 1}));
+}
+
+TEST_CASE("append after reopen preserves LSN and prevLsn chain") {
+  TempFile file;
+  const auto first = update(10, 1, 0, "0", "A");
+  const auto second = update(20, 1, 0, "A", "B");
+  const auto second_after_reopen = update(20, 1, 0, "B", "C");
+
+  {
+    wal::Wal log{file.path};
+    append(log, first, 1);
+    append(log, second, 2);
+  }
+
+  {
+    wal::Wal log{file.path};
+    append(log, second_after_reopen, 3);
+    std::vector<wal::Record> records;
+    log.replay([&](const wal::Record &record) { records.push_back(record); });
+
+    REQUIRE(records.size() == 3);
+    CHECK(same_record(records[0], with_chain(first, 1, 0)));
+    CHECK(same_record(records[1], with_chain(second, 2, 0)));
+    CHECK(same_record(records[2], with_chain(second_after_reopen, 3, 2)));
+  }
+}
+
+TEST_CASE("reopen repairs torn tail before appending next record") {
+  TempFile file;
+  const auto update_record = update(10, 1, 0, "0", "A");
+  const auto commit_record = commit(10);
+
+  {
+    wal::Wal log{file.path};
+    append(log, update_record, 1);
+  }
+
+  {
+    std::ofstream tail(file.path, std::ios::binary | std::ios::app);
+    REQUIRE(tail.good());
+    tail.write("\xa5\x5a", 2);
+    tail.close();
+    REQUIRE(tail.good());
+  }
+
+  {
+    wal::Wal log{file.path};
+    append(log, commit_record, 2);
+    std::vector<wal::Record> records;
+    log.replay([&](const wal::Record &record) { records.push_back(record); });
+
+    REQUIRE(records.size() == 2);
+    CHECK(same_record(records[0], with_chain(update_record, 1, 0)));
+    CHECK(same_record(records[1], with_chain(commit_record, 2, 1)));
+  }
+}
+
+TEST_CASE("replay preserves complete record fields") {
+  TempFile file;
+  const auto update_record = update(77, 9, 4, "before", "after!");
+  const auto commit_record = commit(77);
+  wal::Wal log{file.path};
+  append(log, update_record, 1);
+  append(log, commit_record, 2);
+
+  std::vector<wal::Record> records;
+  log.replay([&](const wal::Record &record) { records.push_back(record); });
+
+  REQUIRE(records.size() == 2);
+  CHECK(same_record(records[0], with_chain(update_record, 1, 0)));
+  CHECK(same_record(records[1], with_chain(commit_record, 2, 1)));
+}
+
+TEST_CASE("recovery undoes loser updates and redoes committed updates") {
+  TempFile file;
+  wal::Wal log{file.path};
+  append_recovery_history(log);
+
+  wal::Page page{};
+  page.pageID = 1;
+  page.lsn = 4;
+  page.data = byte_vector("MM00");
+  log.recover(page);
+
+  expect_page(page, "BB00", 5, 8);
+}
+
+TEST_CASE("recovery rebuilds page with committed winner already applied") {
+  TempFile file;
+  wal::Wal log{file.path};
+  append_recovery_history(log);
+
+  wal::Page page{};
+  page.pageID = 1;
+  page.lsn = 5;
+  page.data = byte_vector("BB00");
+  log.recover(page);
+
+  expect_page(page, "BB00", 5, 8);
+}
+
+TEST_CASE("recovery redoes committed update when page is behind WAL") {
+  TempFile file;
+  wal::Wal log{file.path};
+  append_recovery_history(log);
+
+  wal::Page page{};
+  page.pageID = 2;
+  page.data = byte_vector("0000");
+  log.recover(page);
+
+  expect_page(page, "00XY", 7, 8);
+}
+
+TEST_CASE("recovery is idempotent") {
+  TempFile file;
+  wal::Wal log{file.path};
+  append_recovery_history(log);
+
+  wal::Page page{};
+  page.pageID = 1;
+  page.lsn = 4;
+  page.data = byte_vector("MM00");
+  log.recover(page);
+  expect_page(page, "BB00", 5, 8);
+
+  log.recover(page);
+  expect_page(page, "BB00", 5, 8);
+}
+
+TEST_CASE("late commit redoes update after earlier recovery") {
+  TempFile file;
+  wal::Wal log{file.path};
+  append(log, update(50, 3, 0, "00", "AA"), 1);
+
+  wal::Page page{};
+  page.pageID = 3;
+  page.data = byte_vector("00");
+  log.recover(page);
+  expect_page(page, "00", 0, 1);
+
+  append(log, commit(50), 2);
+  log.recover(page);
+  expect_page(page, "AA", 1, 2);
+
+  log.recover(page);
+  expect_page(page, "AA", 1, 2);
+}
+
+TEST_CASE("recovery rejects page ahead of WAL without mutation") {
+  TempFile file;
+  wal::Wal log{file.path};
+  append(log, update(10, 2, 0, "00", "AA"), 1);
+
+  wal::Page page{};
+  page.pageID = 2;
+  page.lsn = 2;
+  page.recoveredLSN = 2;
+  page.data = byte_vector("0000");
+
+  CHECK_THROWS_AS(log.recover(page), std::runtime_error);
+  expect_page(page, "0000", 2, 2);
+}
+
+TEST_CASE("WAL rejects checksum-corrupted complete frame") {
+  TempFile file;
+  {
+    wal::Wal log{file.path};
+    append(log, update(10, 1, 0, "00", "AA"), 1);
+  }
+
+  {
+    std::fstream log(file.path,
+                     std::ios::binary | std::ios::in | std::ios::out);
+    REQUIRE(log.good());
+    constexpr std::streamoff first_record_redo_offset = 8 + 16 + 52;
+    log.seekg(first_record_redo_offset);
+    char byte{};
+    log.read(&byte, 1);
+    REQUIRE(log.gcount() == 1);
+    byte = static_cast<char>(byte ^ 1);
+    log.seekp(first_record_redo_offset);
+    log.write(&byte, 1);
+    log.flush();
+    REQUIRE(log.good());
+  }
+
+  CHECK_THROWS_AS(wal::Wal{file.path}, std::runtime_error);
 }
