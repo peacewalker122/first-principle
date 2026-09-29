@@ -1,6 +1,6 @@
 # First-principles WAL
 
-Small C++23 write-ahead log on POSIX file APIs. `wal::Wal` stores transaction records and recovers one caller-owned fixed-size page at a time. It does not own page storage or support concurrent writers.
+Small write-ahead log on POSIX file APIs. `wal::Wal` stores transaction records and recovers one caller-owned fixed-size page at a time. It does not own page storage or support concurrent writers.
 
 ## Contract
 
