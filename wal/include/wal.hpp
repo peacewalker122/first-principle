@@ -47,6 +47,7 @@ public:
     [[nodiscard]] std::uint64_t append(const Record& record);
     void replay(const std::function<void(const Record&)>& visitor) const;
     void recover(Page& page);
+    [[nodiscard]] std::uint64_t checkpoint(const std::vector<Page>& pages);
 
 private:
     struct RecoveryPlan {
@@ -55,6 +56,7 @@ private:
         std::vector<std::size_t> redo_indices;
         std::uint64_t latest_lsn{};
         std::uint64_t page_lsn{};
+        std::uint64_t checkpoint_lsn{};
     };
 
     [[nodiscard]] std::uint64_t scan(
@@ -66,6 +68,7 @@ private:
 
     int fd_{-1};
     std::uint64_t next_lsn_{1};
+    std::uint64_t latest_checkpoint_lsn_{};
     std::unordered_map<std::uint64_t, std::uint64_t> previous_lsn_;
     std::unordered_set<std::uint64_t> committed_txids_;
     bool poisoned_{false};

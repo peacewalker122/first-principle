@@ -2,6 +2,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -111,17 +112,62 @@ void append_recovery_history(wal::Wal &log) {
 
 } // namespace
 
-TEST_CASE("new WAL writes WAL1 file header") {
+TEST_CASE("new WAL writes version 2 header with zero checkpoint LSN") {
   TempFile file;
   {
     wal::Wal log{file.path};
   }
 
   std::ifstream input(file.path, std::ios::binary);
-  std::array<char, 8> header{};
+  std::array<char, 16> header{};
   input.read(header.data(), static_cast<std::streamsize>(header.size()));
   REQUIRE(input.gcount() == static_cast<std::streamsize>(header.size()));
-  CHECK((header == std::array<char, 8>{'W', 'A', 'L', '1', 0, 0, 0, 1}));
+  CHECK((std::string_view{header.data(), 8} == std::string_view{"WAL1\0\0\0\2", 8}));
+  CHECK(std::all_of(header.begin() + 8, header.end(), [](char byte) { return byte == 0; }));
+}
+
+TEST_CASE("checkpoint persists the minimum page LSN and recovery accepts that boundary") {
+  TempFile file;
+  wal::Wal log{file.path};
+  append(log, update(10, 1, 0, "0", "A"), 1);
+  append(log, commit(10), 2);
+  append(log, update(20, 2, 0, "0", "B"), 3);
+  append(log, commit(20), 4);
+
+  wal::Page first{};
+  first.pageID = 1;
+  first.lsn = 1;
+  first.data = byte_vector("A");
+  wal::Page second{};
+  second.pageID = 2;
+  second.lsn = 3;
+  second.data = byte_vector("B");
+  CHECK(log.checkpoint({first, second}) == 1);
+  {
+    wal::Wal reopened{file.path};
+    wal::Page behind{};
+    behind.pageID = 2;
+    behind.data = byte_vector("0");
+    CHECK_THROWS_AS(reopened.recover(behind), std::runtime_error);
+    reopened.recover(first);
+    expect_page(first, "A", 1, 4);
+  }
+}
+
+TEST_CASE("checkpoint rejects pages behind the recorded checkpoint") {
+  TempFile file;
+  wal::Wal log{file.path};
+  append(log, update(10, 1, 0, "0", "A"), 1);
+  wal::Page current{};
+  current.pageID = 1;
+  current.lsn = 1;
+  current.data = byte_vector("A");
+  REQUIRE(log.checkpoint({current}) == 1);
+
+  wal::Page behind{};
+  behind.pageID = 1;
+  behind.data = byte_vector("0");
+  CHECK_THROWS_AS(log.recover(behind), std::runtime_error);
 }
 
 TEST_CASE("append after reopen preserves LSN and prevLsn chain") {
@@ -297,7 +343,7 @@ TEST_CASE("WAL rejects checksum-corrupted complete frame") {
     std::fstream log(file.path,
                      std::ios::binary | std::ios::in | std::ios::out);
     REQUIRE(log.good());
-    constexpr std::streamoff first_record_redo_offset = 8 + 16 + 52;
+    constexpr std::streamoff first_record_redo_offset = 16 + 16 + 52;
     log.seekg(first_record_redo_offset);
     char byte{};
     log.read(&byte, 1);

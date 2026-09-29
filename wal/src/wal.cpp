@@ -18,11 +18,12 @@
 namespace wal {
 namespace {
 
-// Eight-byte file header: "WAL1" magic followed by big-endian version 1.
-constexpr std::array<std::byte, 8> kFileHeader{
+// Sixteen-byte header: magic, big-endian version 2, little-endian checkpoint LSN.
+constexpr std::array<std::byte, 8> kFileHeaderPrefix{
     std::byte{0x57}, std::byte{0x41}, std::byte{0x4c}, std::byte{0x31},
-    std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
+    std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x02},
 };
+constexpr std::size_t kFileHeaderSize = 16;
 constexpr std::size_t kFrameHeaderSize = 16;
 constexpr std::size_t kRecordPayloadHeaderSize = 52;
 constexpr std::uint32_t kMaxRecordSize = 64U * 1024U * 1024U;
@@ -131,6 +132,13 @@ std::uint64_t load_u64(std::span<const std::byte> input) {
              << (i * 8U);
   }
   return value;
+}
+
+std::array<std::byte, kFileHeaderSize> make_file_header(std::uint64_t checkpoint_lsn) {
+  std::array<std::byte, kFileHeaderSize> header{};
+  std::copy(kFileHeaderPrefix.begin(), kFileHeaderPrefix.end(), header.begin());
+  store_u64(std::span<std::byte>{header}.subspan(8), checkpoint_lsn);
+  return header;
 }
 
 std::uint32_t update_crc32(std::uint32_t crc,
@@ -287,14 +295,21 @@ Wal::Wal(const std::filesystem::path& path) {
       throw std::runtime_error("WAL has invalid file size");
     }
 
-    if (static_cast<std::uint64_t>(status.st_size) < kFileHeader.size()) {
+    if (static_cast<std::uint64_t>(status.st_size) < kFileHeaderSize) {
       if (::ftruncate(fd_, 0) < 0 || ::lseek(fd_, 0, SEEK_SET) < 0) {
         throw_errno("reset incomplete WAL header");
       }
-      write_all(fd_, kFileHeader);
+      const auto header = make_file_header(0);
+      write_all(fd_, header);
       sync_data(fd_);
       sync_parent_directory(path);
     }
+    std::array<std::byte, kFileHeaderSize> header{};
+    if (!read_exact_at(fd_, 0, header) ||
+        !std::equal(kFileHeaderPrefix.begin(), kFileHeaderPrefix.end(), header.begin())) {
+      throw std::runtime_error("invalid WAL file header");
+    }
+    latest_checkpoint_lsn_ = load_u64(std::span<const std::byte>{header}.subspan(8));
     next_lsn_ = scan(true, [&](Record&& record) {
       previous_lsn_[record.txid] = record.lsn;
       if (record.recordType == RecordType::Commit) {
@@ -377,6 +392,45 @@ void Wal::recover(Page& page) {
   page.recoveredLSN = plan.latest_lsn;
 }
 
+std::uint64_t Wal::checkpoint(const std::vector<Page>& pages) {
+  if (pages.empty()) {
+    throw std::invalid_argument("WAL checkpoint requires at least one page");
+  }
+  std::uint64_t minimum_lsn = std::numeric_limits<std::uint64_t>::max();
+  std::unordered_set<std::uint64_t> page_ids;
+  for (const auto& page : pages) {
+    if (page.pageID == 0 || !page_ids.insert(page.pageID).second) {
+      throw std::invalid_argument("WAL checkpoint page IDs must be nonzero and unique");
+    }
+    minimum_lsn = std::min(minimum_lsn, page.lsn);
+  }
+  (void)scan(false, {});
+  const auto durable_lsn = next_lsn_ == 0
+      ? std::numeric_limits<std::uint64_t>::max() : next_lsn_ - 1;
+  if (minimum_lsn > durable_lsn) {
+    throw std::invalid_argument("WAL checkpoint page LSN is ahead of WAL");
+  }
+  if (minimum_lsn < latest_checkpoint_lsn_) {
+    throw std::invalid_argument("WAL checkpoint cannot move backwards");
+  }
+  const auto header = make_file_header(minimum_lsn);
+  std::size_t written = 0;
+  while (written < header.size()) {
+    const auto count = ::pwrite(fd_, header.data() + written, header.size() - written,
+                                static_cast<off_t>(written));
+    if (count < 0) {
+      if (errno == EINTR) continue;
+      throw_errno("write WAL checkpoint header");
+    }
+    if (count == 0) throw std::system_error(std::make_error_code(std::errc::io_error),
+                                            "write WAL checkpoint header");
+    written += static_cast<std::size_t>(count);
+  }
+  sync_data(fd_);
+  latest_checkpoint_lsn_ = minimum_lsn;
+  return minimum_lsn;
+}
+
 std::uint64_t Wal::scan(
     bool repair_tail,
     const std::function<void(Record&&)>& visitor) const {
@@ -385,20 +439,21 @@ std::uint64_t Wal::scan(
     throw_errno("fstat WAL");
   }
   if (status.st_size < 0 ||
-      static_cast<std::uint64_t>(status.st_size) < kFileHeader.size()) {
+      static_cast<std::uint64_t>(status.st_size) < kFileHeaderSize) {
     throw std::runtime_error("WAL header is incomplete");
   }
 
-  std::array<std::byte, kFileHeader.size()> file_header{};
+  std::array<std::byte, kFileHeaderSize> file_header{};
   if (!read_exact_at(fd_, 0, file_header)) {
     throw std::runtime_error("WAL header is incomplete");
   }
-  if (file_header != kFileHeader) {
+  if (!std::equal(kFileHeaderPrefix.begin(), kFileHeaderPrefix.end(), file_header.begin()) ||
+      load_u64(std::span<const std::byte>{file_header}.subspan(8)) != latest_checkpoint_lsn_) {
     throw std::runtime_error("invalid WAL file header");
   }
 
   const auto file_size = static_cast<std::uint64_t>(status.st_size);
-  auto offset = static_cast<std::uint64_t>(kFileHeader.size());
+  auto offset = static_cast<std::uint64_t>(kFileHeaderSize);
   std::uint64_t expected_lsn = 1;
   bool incomplete_tail = false;
   std::vector<std::byte> payload;
@@ -519,6 +574,11 @@ Wal::RecoveryPlan Wal::analysis(const Page& page) const {
 
   plan.latest_lsn =
       next_lsn == 0 ? std::numeric_limits<std::uint64_t>::max() : next_lsn - 1;
+  plan.checkpoint_lsn = latest_checkpoint_lsn_;
+  if (plan.checkpoint_lsn > plan.latest_lsn ||
+      plan.checkpoint_lsn > std::min(page.lsn, plan.latest_lsn)) {
+    throw std::runtime_error("WAL checkpoint LSN is ahead of WAL");
+  }
   if (page.lsn > plan.latest_lsn || page.recoveredLSN > plan.latest_lsn) {
     throw std::runtime_error("page LSN is ahead of WAL");
   }

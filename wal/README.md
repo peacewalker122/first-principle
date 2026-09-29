@@ -8,6 +8,7 @@ Small C++23 write-ahead log on POSIX file APIs. `wal::Wal` stores transaction re
 - An `Update` names `pageID`, `redoInformation.payload`, and matching redo/undo offsets. `beforeImage.size()`, `undoInformation.size`, and the redo payload size must match. Updates are fixed-size writes.
 - A `Commit` has `pageID == 0` and empty redo, undo, and before-image fields. A transaction is committed only if its WAL contains a `Commit` record.
 - `replay(std::function<void(const Record&)>)` validates and passes full decoded records to the visitor in LSN order, including transaction IDs and `prevLsn` links.
+- `checkpoint(const std::vector<Page>&)` accepts the checkpoint page set and returns the minimum `Page.lsn`. It persists this as `latestCheckpointLSN` in the WAL header, enforcing `checkpoint <= min_pages_modified_lsn`. The page set must be nonempty, contain unique nonzero IDs, and not move the checkpoint backwards. Recovery analysis checks that the checkpoint is not ahead of the WAL or the page being recovered.
 - Opening a WAL truncates an incomplete final frame to the last complete record. A complete frame with a bad checksum, invalid record, or invalid sequence fails instead of being discarded.
 - The WAL supports one process and one writer per file. Each append syncs separately; there is no group commit. The encoded frame body limit is 64 MiB. The WAL requires a POSIX filesystem; initialization syncs the parent directory.
 
@@ -23,7 +24,7 @@ The before-image is required because an offset and size identify overwritten byt
 
 ## Format
 
-The eight-byte file header is `WAL1 00 00 00 01`: `WAL1` magic followed by big-endian version 1. Each frame has a 16-byte header: little-endian LSN (`u64`), body length (`u32`), and CRC-32/IEEE (`u32`). The checksum covers the first 12 frame-header bytes and the body.
+The 16-byte file header contains `WAL1` magic, big-endian version 2, and `latestCheckpointLSN` as a little-endian `u64`. The checkpoint field uses the same `std::uint64_t` type as LSNs. Each frame has a 16-byte header: little-endian LSN (`u64`), body length (`u32`), and CRC-32/IEEE (`u32`). The checksum covers the first 12 frame-header bytes and the body.
 
 The body starts with a fixed 52-byte prefix: record type (`u32`, 0 for `Update`, 1 for `Commit`), then `txid`, `prevLsn`, `pageID`, redo offset, undo offset, and size as little-endian `u64` values. The frame header stores `Record.lsn`. An update body continues with `size` redo bytes followed by `size` before-image bytes. A commit body ends after the prefix; its page ID, offsets, and size are zero. Invalid types, lengths, or metadata fail validation.
 
